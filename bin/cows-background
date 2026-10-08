@@ -1,0 +1,407 @@
+#!/bin/bash
+# cows-background: a looping video wallpaper for Omarchy (Hyprland).
+#
+# mpvpaper plays the video on Hyprland's "bottom" layer, which sits above
+# Omarchy's own wallpaper and below every window and the bar. Nothing that
+# belongs to Omarchy is touched (theme, background symlink, shell or Hyprland
+# config), so `off` leaves the desktop exactly as it was. While it is on, a
+# systemd user service keeps the video playing across logins; `off` stops,
+# disables and deletes that service again.
+
+set -euo pipefail
+
+NAME=cows-background
+UNIT=$NAME.service
+UNIT_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$UNIT"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/$NAME"
+
+# Presets and the loop finder live next to bin/ in a checkout, or in
+# ~/.local/share/cows-background once installed.
+root=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+if [[ -d $root/videos ]]; then
+  SHARE=$root
+else
+  SHARE="${XDG_DATA_HOME:-$HOME/.local/share}/$NAME"
+fi
+
+usage() {
+  cat <<EOF
+Usage: $NAME <command> [video] [options]
+
+Commands:
+  on [video]       Make the video your desktop background (stays on after reboot)
+  off              Put your normal background back and remove every trace
+  status           Show what is playing
+  list             Show the built-in videos, their modes and what is cached
+  build [video]    Prepare a video without turning it on
+  preview [video]  Watch the loop in a normal window first
+
+[video] is a built-in name (default: cows), a video file or a URL.
+
+Options:
+  -m, --mode MODE  pingpong  plays forward, then backward, forever (no jump ever)
+                   perfect   loops the most seamless section the video has
+                   loop      plays the video start to end, then starts over
+                   (default: the video's own choice, pingpong for cows)
+  --start SEC      For files and URLs: ignore everything before SEC
+  --end SEC        For files and URLs: ignore everything after SEC
+  --min-loop SEC   Shortest section 'perfect' may pick (default: 10)
+  --fit            Show the whole frame with black bars instead of filling the screen
+  --purge          With 'off': also delete the prepared videos (~/.cache/$NAME)
+
+Examples:
+  $NAME on                         cows & cows & cows, ping-pong
+  $NAME on --mode perfect          the 19.5 s section that loops invisibly
+  $NAME on ~/Videos/rain.mp4 -m perfect --min-loop 5
+  $NAME on https://youtu.be/... -m pingpong --start 3 --end 60
+  $NAME off
+EOF
+}
+
+die() { echo "$NAME: $*" >&2; exit 1; }
+say() { echo "$NAME: $*" >&2; }
+need() {
+  local cmd
+  for cmd; do
+    command -v "$cmd" >/dev/null || die "needs '$cmd' (install it with: omarchy pkg add $cmd)"
+  done
+}
+
+# ---------------------------------------------------------------- options
+
+COMMAND=${1:-help}
+(($#)) && shift
+VIDEO="" MODE="" START="" END="" MIN_LOOP=10 FIT=0 PURGE=0
+while (($#)); do
+  case $1 in
+    -m | --mode) MODE=${2:?--mode needs a value}; shift 2 ;;
+    --start) START=${2:?--start needs seconds}; shift 2 ;;
+    --end) END=${2:?--end needs seconds}; shift 2 ;;
+    --min-loop) MIN_LOOP=${2:?--min-loop needs seconds}; shift 2 ;;
+    --fit) FIT=1; shift ;;
+    --purge) PURGE=1; shift ;;
+    -h | --help) usage; exit 0 ;;
+    -*) die "unknown option: $1 (see $NAME --help)" ;;
+    *) [[ -z $VIDEO ]] || die "one video at a time"; VIDEO=$1; shift ;;
+  esac
+done
+[[ -z $MODE || $MODE =~ ^(pingpong|perfect|loop)$ ]] || die "unknown mode '$MODE' (pingpong, perfect or loop)"
+for n in "$START" "$END" "$MIN_LOOP"; do
+  [[ -z $n || $n =~ ^[0-9]+([.][0-9]+)?$ ]] || die "'$n' is not a number of seconds"
+done
+
+# ---------------------------------------------------------------- videos
+
+# Sets KIND (preset|file|url), KEY (cache name), LABEL, SRC (file or URL) and,
+# for presets, the frame ranges from videos/<name>.conf.
+resolve_video() {
+  VIDEO=${VIDEO:-cows}
+  if [[ -f $SHARE/videos/$VIDEO.conf && $VIDEO != */* ]]; then
+    KIND=preset KEY=$VIDEO
+    TITLE="" URL="" FORMAT="" FPS="" DEFAULT_MODE="" PINGPONG="" PERFECT="" LOOP=""
+    # shellcheck source=/dev/null
+    source "$SHARE/videos/$VIDEO.conf"
+    LABEL=$TITLE SRC=$URL
+    [[ -z $START && -z $END ]] || die "--start/--end are for files and URLs; built-in videos have fixed ranges"
+    MODE=${MODE:-$DEFAULT_MODE}
+    local range=${MODE^^}
+    [[ -n ${!range:-} ]] || die "'$VIDEO' has no $MODE mode (see $NAME list)"
+    return
+  fi
+
+  local id
+  if [[ -f $VIDEO ]]; then
+    KIND=file SRC=$(realpath "$VIDEO") LABEL=$(basename "$VIDEO")
+  elif [[ $VIDEO =~ ^https?:// ]]; then
+    KIND=url SRC=$VIDEO LABEL=$VIDEO
+  else
+    die "'$VIDEO' is not a built-in video, a file or a URL (see $NAME list)"
+  fi
+  MODE=${MODE:-pingpong}
+  id=$(printf '%s|%s|%s|%s' "$SRC" "$START" "$END" "$MIN_LOOP" | sha1sum | cut -c1-10)
+  KEY=$(basename "${LABEL%%\?*}" | sed 's/\.[^.]*$//; s/[^A-Za-z0-9_-]\+/-/g' | cut -c1-40)-$id
+}
+
+# Downloads a preset's or URL's source video once; prints its path.
+fetch_source() {
+  local existing
+  existing=$(compgen -G "$CACHE/src/$KEY.*" | grep -v '\.part$' | head -n1 || true)
+  if [[ -n $existing ]]; then
+    echo "$existing"
+    return
+  fi
+  need yt-dlp
+  mkdir -p "$CACHE/src"
+  say "downloading $LABEL"
+  yt-dlp --no-playlist -f "${FORMAT:-bestvideo[height<=1080]/best[height<=1080]/best}" \
+    -o "$CACHE/src/$KEY.%(ext)s" "$SRC" >&2
+  compgen -G "$CACHE/src/$KEY.*" | grep -v '\.part$' | head -n1
+}
+
+probe_fps() {
+  local rate
+  rate=$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of csv=p=0 "$1")
+  awk -F/ '{ if ($2 > 0 && $1 > 0) printf "%.6f", $1 / $2 }' <<<"$rate"
+}
+
+count_frames() {
+  ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$1"
+}
+
+# ffmpeg input options that start decoding at frame $1 (half a frame early,
+# so the frame that sits exactly on the boundary is kept).
+seek_to() {
+  (($1 > 0)) && awk -v f="$1" -v r="$FPS" 'BEGIN { printf "-ss %.6f", (f - 0.5) / r }'
+  return 0
+}
+
+# Final encode: H.264 decodes in hardware on every GPU, and timestamps are
+# rewritten so the loop has an even frame rate all the way round.
+ENCODE=(-an -sn -dn -c:v libx264 -preset slow -crf 20 -pix_fmt yuv420p -movflags +faststart)
+EVEN="scale=trunc(iw/2)*2:trunc(ih/2)*2"
+
+# Renders frames [$2, $3) of $1 into $4.
+render_range() {
+  local src=$1 first=$2 end=$3 out=$4
+  # shellcheck disable=SC2046
+  ffmpeg -v error -stats -y $(seek_to "$first") -i "$src" -map 0:v:0 -frames:v $((end - first)) \
+    -vf "$EVEN,setpts=N/($FPS*TB)" -r "$FPS" "${ENCODE[@]}" "$out"
+}
+
+# Renders frames [$2, $3) of $1 forward, then backward without repeating the
+# turning frames, into $4. Reversing needs every frame of a clip in memory, so
+# the backward half is reversed 50 frames at a time.
+render_pingpong() {
+  local src=$1 first=$2 end=$3 out=$4 tmp hi lo k=1 frames
+  tmp=$(mktemp -d "$CACHE/tmp.XXXXXX")
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp' '$out'" EXIT
+
+  say "forward pass"
+  # shellcheck disable=SC2046
+  ffmpeg -v error -stats -y $(seek_to "$first") -i "$src" -map 0:v:0 -frames:v $((end - first)) \
+    -vf "$EVEN" -an -c:v libx264 -preset veryfast -crf 10 "$tmp/0000.mkv"
+  frames=$(count_frames "$tmp/0000.mkv")
+  end=$((first + frames))
+
+  say "backward pass"
+  hi=$((end - 1))
+  while ((hi > first + 1)); do
+    lo=$((hi - 50 > first + 1 ? hi - 50 : first + 1))
+    # trim, not just -frames:v: reverse waits for the end of its input, so the
+    # input itself has to stop after this chunk.
+    # shellcheck disable=SC2046
+    ffmpeg -v error -y $(seek_to "$lo") -i "$src" -map 0:v:0 -frames:v $((hi - lo)) \
+      -vf "$EVEN,trim=end_frame=$((hi - lo)),reverse" -an -c:v libx264 -preset veryfast -crf 10 \
+      "$tmp/$(printf %04d "$k").mkv"
+    printf '\r  %d%%' $((100 * (end - lo) / (end - first))) >&2
+    hi=$lo k=$((k + 1))
+  done
+  echo >&2
+
+  for f in "$tmp"/*.mkv; do printf "file '%s'\n" "$f"; done >"$tmp/list.txt"
+  say "encoding"
+  ffmpeg -v error -stats -y -f concat -safe 0 -i "$tmp/list.txt" \
+    -vf "setpts=N/($FPS*TB)" -r "$FPS" "${ENCODE[@]}" "$out"
+
+  local want=$((2 * frames - 2)) got
+  got=$(count_frames "$out")
+  ((got == want)) || die "ping-pong came out with $got frames instead of $want"
+  rm -rf "$tmp"
+  trap - EXIT
+}
+
+# Makes sure the loop for VIDEO/MODE exists; sets OUT to its path.
+build() {
+  need ffmpeg ffprobe
+  resolve_video
+  OUT="$CACHE/$KEY-$MODE.mp4"
+  [[ -s $OUT ]] && return
+
+  local src first end info ratio
+  mkdir -p "$CACHE"
+  case $KIND in
+    preset | url) src=$(fetch_source) ;;
+    file) src=$SRC ;;
+  esac
+  [[ -f $src ]] || die "could not get the video"
+
+  if [[ $KIND == preset ]]; then
+    local range=${MODE^^}
+    first=${!range%:*} end=${!range#*:}
+  else
+    FPS=$(probe_fps "$src")
+    [[ -n $FPS ]] || die "could not read the frame rate of $src"
+    first=0 end=$(count_frames "$src")
+    [[ -n $START ]] && first=$(awk -v s="$START" -v r="$FPS" 'BEGIN { printf "%d", s * r + 0.5 }')
+    [[ -n $END ]] && end=$(awk -v s="$END" -v r="$FPS" -v n="$end" 'BEGIN { e = int(s * r + 0.5); print (e < n ? e : n) }')
+    ((end - first > 2)) || die "nothing left between --start and --end"
+
+    if [[ $MODE == perfect ]]; then
+      need python3
+      python3 -c 'import numpy' 2>/dev/null || die "perfect mode needs numpy (omarchy pkg add python-numpy)"
+      say "comparing every frame with every other frame to find the best loop"
+      info=$(python3 "$SHARE/lib/find-loop.py" "$src" --min-loop "$MIN_LOOP" \
+        --start "$(awk -v f="$first" -v r="$FPS" 'BEGIN { printf "%.6f", f / r }')" \
+        --end "$(awk -v f="$end" -v r="$FPS" 'BEGIN { printf "%.6f", f / r }')")
+      read -r first end _ ratio <<<"$info"
+      say "$(awk -v a="$first" -v b="$end" -v r="$FPS" -v q="$ratio" 'BEGIN {
+        printf "loop %.2fs to %.2fs (%.1fs); the jump is %.1fx a normal frame step%s",
+          a / r, b / r, (b - a) / r, q, (q <= 1.3 ? ", invisible" : (q <= 2.2 ? ", barely visible" : ", a visible cut")) }')"
+    fi
+  fi
+
+  say "preparing $LABEL ($MODE)"
+  if [[ $MODE == pingpong ]]; then
+    render_pingpong "$src" "$first" "$end" "$OUT.tmp.mp4"
+  else
+    render_range "$src" "$first" "$end" "$OUT.tmp.mp4"
+  fi
+  mv "$OUT.tmp.mp4" "$OUT"
+}
+
+# ---------------------------------------------------------------- service
+
+# systemd unit lines get specifiers (%) and variables ($) expanded.
+unit_quote() {
+  local s=${1//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//%/%%}
+  s=${s//\$/\$\$}
+  printf '"%s"' "$s"
+}
+
+# On hybrid laptops, render and decode on the integrated GPU so a wallpaper
+# never wakes the discrete one. mpv's automatic hwdec would try NVDEC (CUDA)
+# first, which opens /dev/nvidia0, so VA-API is named explicitly there.
+GPU_ENV=() HWDEC=auto-safe
+detect_gpus() {
+  local vendor nvidia=0 intel=0 amd=0
+  for vendor in /sys/class/drm/renderD*/device/vendor; do
+    [[ -r $vendor ]] || continue
+    case $(<"$vendor") in
+      0x10de) nvidia=1 ;;
+      0x8086) intel=1 ;;
+      0x1002) amd=1 ;;
+    esac
+  done
+  ((nvidia && (intel || amd))) || return 0
+  HWDEC=vaapi
+  GPU_ENV+=("CUDA_VISIBLE_DEVICES=")
+  [[ -f /usr/share/glvnd/egl_vendor.d/50_mesa.json ]] &&
+    GPU_ENV+=("__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json")
+  if ((intel)); then GPU_ENV+=("LIBVA_DRIVER_NAME=iHD"); else GPU_ENV+=("LIBVA_DRIVER_NAME=radeonsi"); fi
+}
+
+write_unit() {
+  detect_gpus
+  local env mpv_opts="no-audio loop-file=inf hwdec=$HWDEC quiet msg-level=all=warn"
+  ((FIT)) && mpv_opts+=" panscan=0" || mpv_opts+=" panscan=1.0"
+  mkdir -p "$(dirname "$UNIT_FILE")"
+  cat >"$UNIT_FILE" <<EOF
+# Written by $NAME on; '$NAME off' removes it.
+[Unit]
+Description=$NAME: ${LABEL//%/%%} ($MODE)
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+
+[Service]
+$(for env in "${GPU_ENV[@]}"; do echo "Environment=$(unit_quote "$env")"; done)
+ExecStart=$(command -v mpvpaper) --auto-pause --layer bottom --mpv-options $(unit_quote "$mpv_opts") "*" $(unit_quote "$OUT")
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+}
+
+cmd_on() {
+  need mpvpaper systemctl
+  build
+  write_unit
+  systemctl --user daemon-reload
+  systemctl --user enable "$UNIT" 2>/dev/null
+  systemctl --user restart "$UNIT"
+  sleep 1
+  if ! systemctl --user is-active --quiet "$UNIT"; then
+    journalctl --user -u "$UNIT" -n 20 --no-pager >&2 || true
+    cmd_off >/dev/null 2>&1
+    die "mpvpaper did not start (log above); nothing was changed"
+  fi
+  say "on: $LABEL ($MODE). '$NAME off' puts your background back."
+}
+
+cmd_off() {
+  if [[ -f $UNIT_FILE ]] || systemctl --user cat "$UNIT" &>/dev/null; then
+    systemctl --user disable --now "$UNIT" 2>/dev/null || true
+    rm -f "$UNIT_FILE"
+    systemctl --user daemon-reload
+    systemctl --user reset-failed "$UNIT" 2>/dev/null || true
+  fi
+  # An instance started some other way (for example by hand from the cache).
+  pkill -f -- "mpvpaper .*$CACHE/" 2>/dev/null || true
+  rm -rf "$CACHE"/tmp.* "$CACHE"/*.tmp.mp4 2>/dev/null || true
+  if ((PURGE)); then
+    rm -rf "$CACHE"
+    say "off; prepared videos deleted"
+  else
+    say "off; your normal background is back"
+  fi
+}
+
+cmd_status() {
+  if systemctl --user is-active --quiet "$UNIT" 2>/dev/null; then
+    systemctl --user show -p Description --value "$UNIT" | sed "s/^$NAME: /on: /"
+  else
+    echo "off"
+  fi
+}
+
+cmd_list() {
+  local conf name
+  echo "Built-in videos:"
+  for conf in "$SHARE"/videos/*.conf; do
+    name=$(basename "$conf" .conf)
+    (
+      TITLE="" DEFAULT_MODE="" PINGPONG="" PERFECT="" LOOP=""
+      # shellcheck source=/dev/null
+      source "$conf"
+      modes=""
+      for m in pingpong perfect loop; do
+        r=${m^^}
+        [[ -n ${!r} ]] || continue
+        f=${!r%:*} e=${!r#*:}
+        pp=1 star=""
+        [[ $m == pingpong ]] && pp=2
+        [[ $m == "$DEFAULT_MODE" ]] && star="*"
+        len=$(awk -v n="$((e - f))" -v r="$FPS" -v pp="$pp" 'BEGIN { printf "%.1f", (n * pp - 2 * (pp - 1)) / r }')
+        modes+=" $m (${len}s)$star"
+      done
+      printf '  %-8s %s\n           modes:%s\n' "$name" "$TITLE" "$modes"
+    )
+  done
+  echo "  (* = default)  Files and URLs work too: pingpong, perfect or loop."
+  if compgen -G "$CACHE/*.mp4" >/dev/null; then
+    echo "Prepared (in $CACHE):"
+    du -h "$CACHE"/*.mp4 | sed "s|$CACHE/||; s/^/  /"
+  fi
+}
+
+cmd_preview() {
+  need mpv
+  build
+  mpv --no-audio --loop-file=inf --title="$NAME preview: $LABEL ($MODE)" "$OUT"
+}
+
+case $COMMAND in
+  on) cmd_on ;;
+  off) cmd_off ;;
+  status) cmd_status ;;
+  list) cmd_list ;;
+  build) build; say "ready: $OUT" ;;
+  preview) cmd_preview ;;
+  help | -h | --help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac
